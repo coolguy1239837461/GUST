@@ -19710,6 +19710,7 @@ _VIEWER_DL_JS +
                         /((?:^|[^.\w$])(?:import|export)\b[^'"()]*?\bfrom\s*)(['"])([^'"\n]+)(\2)/g,
                         /((?:^|[^.\w$])import\s*)(['"])([^'"\n]+)(\2)/g,
                         /((?:^|[^.\w$])import\s*\(\s*)(['"])([^'"\n]+)(\2)/g,
+                        /((?:^|[^.\w$])import\s*\(\s*)(\x60)((?:(?!\$\{)[^\x60\n])+)(\2)/g,
                     ];
                     // UTF-8 JS source -> data: URL. base64 (not percent-encoding) keeps the URL
                     // compact; charset=utf-8 avoids the Latin-1 mis-decode that turns non-ASCII
@@ -19749,6 +19750,16 @@ _VIEWER_DL_JS +
                         }
                         return out;
                     }
+                    // Some frameworks (including SvelteKit) bootstrap from a classic
+                    // inline script that calls import("/path/to/entry.js"). These
+                    // imports otherwise resolve against the blob document URL.
+                    await Promise.all([...doc.querySelectorAll('script:not([src]):not([data-gust-injected]):not([type="module"])')].map(async scr => {
+                        const t = (scr.getAttribute('type') || '').toLowerCase();
+                        if (t && t !== 'text/javascript' && t !== 'application/javascript') return;
+                        const code = scr.textContent;
+                        if (!code || !/\bimport\s*\(\s*['"](?:https?:\/\/|\/|\.)/.test(code)) return;
+                        try { scr.textContent = await transformModuleSource(code, url); } catch {}
+                    }));
                     async function proxyEsmModule(absUrl) {
                         if (_esmBlobCache.has(absUrl)) { const v = _esmBlobCache.get(absUrl); return v === null ? absUrl : v; }
                         if (_esmInflight.has(absUrl)) return _esmInflight.get(absUrl);
