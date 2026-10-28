@@ -16526,6 +16526,16 @@ function proxyDynamicScript(realUrl) {
     parent.postMessage({ t: 'qjs', i, url: realUrl }, '*');
   });
 }
+window.__gustImportModule = function(spec, base, options) {
+    const raw = String(spec);
+    if (!/^(https?:\/\/|\/|\.)/i.test(raw)) return options === undefined ? import(raw) : import(raw, options);
+    let abs;
+    try { abs = new URL(raw, base || BASE).href; } catch (e) { return Promise.reject(e); }
+    return proxyDynamicScript(abs).then(dataUrl => {
+        if (!dataUrl) throw new TypeError('GUST could not proxy module: ' + abs);
+        return options === undefined ? import(dataUrl) : import(dataUrl, options);
+    });
+};
 // Dynamic scripts must EXECUTE in insertion order: module loaders (Google boq's
 // chunk loader on chromewebstore, webpack with script.async=false) insert
 // chunk A then B and rely on A defining what B calls. Our swap sets each src
@@ -18045,6 +18055,7 @@ parent.postMessage({ t: 'ready' }, '*');
                         if (r.skipped || !r.buf || !r.buf.byteLength) { _replyTo?.postMessage({ t: 'r', i, e: 'empty' }, '*'); return; }
                         let jsText = new TextDecoder('utf-8').decode(new Uint8Array(r.buf));
                         try { if (window.__gustRewriteJs) jsText = window.__gustRewriteJs(jsText); } catch (e) {}
+                        try { if (window.__gustRewriteDynamicImports) jsText = window.__gustRewriteDynamicImports(jsText, url); } catch (e) {}
                         const bytes = new TextEncoder().encode(jsText);
                         let bin = ''; const CH = 32768;
                         for (let j = 0; j < bytes.length; j += CH) bin += String.fromCharCode.apply(null, bytes.subarray(j, j + CH));
@@ -19238,6 +19249,15 @@ _VIEWER_DL_JS +
                     // Remove any other base tags to prevent conflicts
                     doc.querySelectorAll('base').forEach(b => { if (b !== base) b.remove(); });
 
+                    // Flash emulators may parse the movie URL without consulting
+                    // document.baseURI, so give object/embed movie URLs an explicit base.
+                    doc.querySelectorAll('object[data], embed[src], param[name="movie" i][value]').forEach(el => {
+                        const attr = el.localName === 'object' ? 'data' : el.localName === 'embed' ? 'src' : 'value';
+                        const value = el.getAttribute(attr);
+                        if (!value || /^(data:|blob:|javascript:|about:)/i.test(value)) return;
+                        try { el.setAttribute(attr, new URL(value, baseHref).href); } catch {}
+                    });
+
                     // Enforce "no iframe loads directly" at the browser level. A page can
                     // navigate a child frame to a real URL by many vectors — iframe.src,
                     // innerHTML, document.write, form target, or named-frame nav
@@ -19701,10 +19721,33 @@ _VIEWER_DL_JS +
                         for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
                         return out;
                     }
+                    function rewriteDynamicImports(src, moduleUrl) {
+                        if (!src || src.indexOf('import') === -1) return src;
+                        let ast;
+                        try {
+                            ast = acorn.parse(src, { ecmaVersion: 'latest', allowReturnOutsideFunction: true,
+                                allowAwaitOutsideFunction: true, allowHashBang: true, allowImportExportEverywhere: true });
+                        } catch (e) { return src; }
+                        const edits = [];
+                        acorn.walk.full(ast, n => {
+                            if (n.type !== 'ImportExpression') return;
+                            const spec = n.source;
+                            if (spec.type === 'Literal' && typeof spec.value === 'string') return;
+                            if (spec.type === 'TemplateLiteral' && !spec.expressions.length) return;
+                            const options = n.options ? ', ' + src.slice(n.options.start, n.options.end) : '';
+                            edits.push({ start: n.start, end: n.end,
+                                text: 'window.__gustImportModule(' + src.slice(spec.start, spec.end) + ', ' + JSON.stringify(moduleUrl) + options + ')' });
+                        });
+                        edits.sort((a, b) => b.start - a.start);
+                        let out = src;
+                        for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+                        return out;
+                    }
                     // Expose the AST rewriter to the parent-scope message handler so
                     // dynamically-injected <script src> (fetched at runtime, not in the
                     // initial HTML) get the same location rewrite. See the 'qjs' handler.
                     try { window.__gustRewriteJs = rewriteLocationRefs; } catch (e) {}
+                    try { window.__gustRewriteDynamicImports = rewriteDynamicImports; } catch (e) {}
                     // import / export … from "spec"   |   import "spec"   |   import("spec")
                     const _esmPatterns = [
                         /((?:^|[^.\w$])(?:import|export)\b[^'"()]*?\bfrom\s*)(['"])([^'"\n]+)(\2)/g,
@@ -19741,7 +19784,7 @@ _VIEWER_DL_JS +
                             // failed does the real URL survive with no map entry (direct load).
                             specMap.set(spec, dep);
                         }));
-                        let out = rewriteLocationRefs(src).replace(/\bimport\.meta\.url\b/g, JSON.stringify(moduleUrl));
+                        let out = rewriteDynamicImports(rewriteLocationRefs(src), moduleUrl).replace(/\bimport\.meta\.url\b/g, JSON.stringify(moduleUrl));
                         for (const re of _esmPatterns) {
                             out = out.replace(re, (full, pre, q, spec, q2) => {
                                 const rep = specMap.get(spec);
@@ -19811,8 +19854,8 @@ _VIEWER_DL_JS +
                         const t = (scr.getAttribute('type') || '').toLowerCase();
                         if (t && t !== 'text/javascript' && t !== 'application/javascript' && t !== 'module') return;
                         const code = scr.textContent;
-                        if (!code || code.indexOf('location') === -1) return;
-                        try { scr.textContent = rewriteLocationRefs(code); } catch {}
+                        if (!code || (code.indexOf('location') === -1 && code.indexOf('import') === -1)) return;
+                        try { scr.textContent = rewriteDynamicImports(rewriteLocationRefs(code), url); } catch {}
                     });
 
                     // JS - keep as external scripts to preserve defer/module semantics.
@@ -19908,7 +19951,7 @@ _VIEWER_DL_JS +
                             if (activeTabId !== initiatorTabId) return;
                             if (jsR.buf && jsR.buf.byteLength) {
                                 // Decode → rewrite location refs to __gustLoc → re-encode as UTF-8 bytes.
-                                const jsText = rewriteLocationRefs(new TextDecoder('utf-8').decode(new Uint8Array(jsR.buf)));
+                                const jsText = rewriteDynamicImports(rewriteLocationRefs(new TextDecoder('utf-8').decode(new Uint8Array(jsR.buf))), jsUrl);
                                 const bytes = new TextEncoder().encode(jsText);
                                 let bin = '';
                                 const chunk = 32768;
